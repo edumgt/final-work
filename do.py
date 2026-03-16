@@ -72,6 +72,29 @@ def ffmpeg_filter_path(path: Path) -> str:
 def safe_mkdir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
+def clear_generated_outputs(out_dir: Path):
+    generated_dirs = ["slides", "audio", "clips"]
+    generated_files = [
+        "analysis.json",
+        "concat.txt",
+        "joined.mp4",
+        "subtitles.srt",
+    ]
+
+    for dirname in generated_dirs:
+        target = out_dir / dirname
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+
+    for filename in generated_files:
+        target = out_dir / filename
+        if target.exists():
+            target.unlink()
+
+    for mp4_file in out_dir.glob("*_analysis_video.mp4"):
+        if mp4_file.is_file():
+            mp4_file.unlink()
+
 def open_file_with_default_app(path: Path):
     try:
         if os.name == "nt":
@@ -1025,6 +1048,7 @@ def main():
     repo_dir = Path(args.repo).resolve()
     out_dir = Path(args.out).resolve()
     safe_mkdir(out_dir)
+    clear_generated_outputs(out_dir)
 
     if not repo_dir.exists():
         print(f"[ERROR] repo 경로가 없습니다: {repo_dir}")
