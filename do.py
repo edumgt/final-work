@@ -72,6 +72,17 @@ def ffmpeg_filter_path(path: Path) -> str:
 def safe_mkdir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
+def open_file_with_default_app(path: Path):
+    try:
+        if os.name == "nt":
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except Exception as e:
+        print(f"[WARN] 생성된 파일을 자동으로 열지 못했습니다: {e}")
+
 def load_font(size=32, bold=False):
     for fp in FONT_CANDIDATES:
         if os.path.exists(fp):
@@ -182,6 +193,70 @@ def summarize_readme(markdown_text: str):
         "badge_count": len(badges),
         "link_count": len(links)
     }
+
+def normalize_markdown_line(line: str) -> str:
+    line = line.rstrip()
+    if not line:
+        return ""
+    if re.match(r"^\s*```", line):
+        return ""
+    line = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"[image] \1", line)
+    line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", line)
+    line = re.sub(r"`([^`]+)`", r"\1", line)
+    line = re.sub(r"^\s*>\s?", "", line)
+    if re.match(r"^\s*[-*+]\s+", line):
+        line = re.sub(r"^\s*[-*+]\s+", "- ", line)
+    elif re.match(r"^\s*\d+[.)]\s+", line):
+        line = re.sub(r"^\s*(\d+[.)])\s+", r"\1 ", line)
+    elif re.match(r"^\s*#{1,6}\s+", line):
+        title = re.sub(r"^\s*#{1,6}\s+", "", line).strip()
+        return title
+    return clean_text(line)
+
+def paginate_readme_for_slides(markdown_text: str, page_chars=380, max_pages=12):
+    sections = extract_readme_sections(markdown_text)
+    pages = []
+
+    for sec in sections:
+        raw_lines = [normalize_markdown_line(line) for line in sec["body"].splitlines()]
+        lines = [line for line in raw_lines if line]
+        if not lines:
+            continue
+
+        current = []
+        current_len = 0
+        page_no = 1
+
+        for line in lines:
+            line_len = max(len(line), 12)
+            extra = line_len + (1 if current else 0)
+            if current and current_len + extra > page_chars:
+                pages.append({
+                    "title": sec["title"],
+                    "body": "\n".join(current),
+                    "page_no": page_no
+                })
+                current = [line]
+                current_len = line_len
+                page_no += 1
+            else:
+                current.append(line)
+                current_len += extra
+
+        if current:
+            pages.append({
+                "title": sec["title"],
+                "body": "\n".join(current),
+                "page_no": page_no
+            })
+
+        if len(pages) >= max_pages:
+            break
+
+    total_pages = len(pages)
+    for page in pages:
+        page["page_total"] = total_pages
+    return pages[:max_pages]
 
 
 # =========================================================
@@ -306,7 +381,7 @@ def build_file_tree(repo_dir: Path, max_depth=2, max_items_per_dir=8):
 # 내레이션 스크립트 생성
 # =========================================================
 
-def create_video_outline(repo_name, readme_summary, repo_analysis, tree_text):
+def create_video_outline(repo_name, readme_summary, repo_analysis, tree_text, readme_pages=None):
     project_type = detect_project_type(repo_analysis)
 
     top_ext_text = ", ".join(
@@ -344,6 +419,19 @@ def create_video_outline(repo_name, readme_summary, repo_analysis, tree_text):
             f"프로젝트 소개와 외부 연계 정보가 비교적 잘 정리된 편입니다."
         )
     })
+
+    for page in readme_pages or []:
+        page_label = f"{page['page_no']}/{page['page_total']}"
+        sections.append({
+            "title": f"README 슬라이드 - {page['title']}",
+            "narration": (
+                f"지금 보이는 화면은 README의 {page['title']} 섹션 {page_label} 페이지입니다. "
+                "10초 동안 화면의 내용을 중심으로 프로젝트 설명을 읽어볼 수 있도록 구성했습니다."
+            ),
+            "display_body": page["body"],
+            "duration": 10.0,
+            "footer": f"README {page_label}"
+        })
 
     for sec in readme_summary["sections"][:4]:
         sections.append({
@@ -506,25 +594,55 @@ def write_srt(srt_path: Path, segments):
 
 def draw_multiline(draw, text, box, font, fill, line_spacing=8):
     x, y, w, h = box
-    words = text.split()
-    lines = []
-    cur = ""
 
-    for word in words:
-        test = cur + (" " if cur else "") + word
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] <= w:
-            cur = test
-        else:
-            if cur:
-                lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
+    def text_width(value: str) -> int:
+        if not value:
+            return 0
+        bbox = draw.textbbox((0, 0), value, font=font)
+        return bbox[2] - bbox[0]
+
+    def wrap_paragraph(paragraph: str):
+        if not paragraph:
+            return [""]
+
+        tokens = re.findall(r"\S+\s*|\s+", paragraph)
+        if not tokens:
+            tokens = list(paragraph)
+
+        lines = []
+        current = ""
+        for token in tokens:
+            candidate = current + token
+            if current and text_width(candidate.rstrip()) > w:
+                stripped = token.strip()
+                if text_width(token.rstrip()) > w and stripped:
+                    for ch in stripped:
+                        char_candidate = current + ch
+                        if current and text_width(char_candidate) > w:
+                            lines.append(current.rstrip())
+                            current = ch
+                        else:
+                            current = char_candidate
+                else:
+                    lines.append(current.rstrip())
+                    current = token.lstrip()
+            else:
+                current = candidate
+
+        if current.strip():
+            lines.append(current.rstrip())
+        elif not lines:
+            lines.append("")
+        return lines
+
+    lines = []
+    for paragraph in text.splitlines():
+        wrapped = wrap_paragraph(paragraph)
+        lines.extend(wrapped)
 
     cur_y = y
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
+        bbox = draw.textbbox((0, 0), line or "Ag", font=font)
         line_h = bbox[3] - bbox[1]
         if cur_y + line_h > y + h:
             break
@@ -536,7 +654,7 @@ def create_slide_image(title, body, out_path: Path, footer="", tree_text=None):
     draw = ImageDraw.Draw(img)
 
     title_font = load_font(42, bold=True)
-    body_font = load_font(28)
+    body_font = load_font(30)
     small_font = load_font(20)
 
     # 상단 라인
@@ -546,8 +664,9 @@ def create_slide_image(title, body, out_path: Path, footer="", tree_text=None):
     draw.text((60, 28), title, font=title_font, fill=DEFAULT_FG)
 
     # 본문
-    body_box = (60, 130, VIDEO_WIDTH - 120, 360)
-    draw_multiline(draw, body, body_box, body_font, DEFAULT_FG, line_spacing=10)
+    draw.rounded_rectangle((40, 118, VIDEO_WIDTH - 40, VIDEO_HEIGHT - 88), radius=24, fill=(14, 20, 32))
+    body_box = (72, 150, VIDEO_WIDTH - 144, 470)
+    draw_multiline(draw, body, body_box, body_font, DEFAULT_FG, line_spacing=12)
 
     # 트리 또는 추가 정보
     if tree_text:
@@ -591,24 +710,27 @@ def create_video_from_sections(sections, work_dir: Path, final_mp4: Path):
         slide_png = slides_dir / f"slide_{i:02d}.png"
         audio_wav = audio_dir / f"audio_{i:02d}.wav"
         clip_mp4 = clips_dir / f"clip_{i:02d}.mp4"
+        body_text = sec.get("display_body", sec["narration"])
+        footer_text = sec.get("footer", f"Section {i:02d}")
+        duration_override = sec.get("duration")
 
         create_slide_image(
             title=sec["title"],
-            body=sec["narration"],
+            body=body_text,
             out_path=slide_png,
-            footer=f"Section {i:02d}",
+            footer=footer_text,
             tree_text=sec.get("extra_tree")
         )
 
         tts_to_file(sec["narration"], audio_wav, rate=165, voice_keyword=None)
-        duration = ffprobe_duration(audio_wav)
+        duration = duration_override or ffprobe_duration(audio_wav)
         if duration <= 0:
             duration = estimate_speech_seconds(sec["narration"])
 
         srt_segments.append({
             "start": elapsed,
             "end": elapsed + duration,
-            "text": sec["narration"]
+            "text": sec.get("subtitle_text", sec["narration"])
         })
         elapsed += duration
 
@@ -622,8 +744,8 @@ def create_video_from_sections(sections, work_dir: Path, final_mp4: Path):
             "-t", f"{duration:.3f}",
             "-pix_fmt", "yuv420p",
             "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps={FPS}",
+            "-af", f"apad=pad_dur={duration:.3f}",
             "-c:a", "aac",
-            "-shortest",
             str(clip_mp4)
         ]
         run_cmd(cmd)
@@ -683,10 +805,11 @@ def main():
     repo_name = repo_dir.name
     readme_text = read_text_file(readme_path)
     readme_summary = summarize_readme(readme_text)
+    readme_pages = paginate_readme_for_slides(readme_text, page_chars=380, max_pages=10)
     repo_analysis = analyze_repo(repo_dir)
     tree_text = build_file_tree(repo_dir, max_depth=2, max_items_per_dir=8)
 
-    outline = create_video_outline(repo_name, readme_summary, repo_analysis, tree_text)
+    outline = create_video_outline(repo_name, readme_summary, repo_analysis, tree_text, readme_pages=readme_pages)
     outline = rebalance_to_target(outline, target_seconds=TARGET_TOTAL_SECONDS)
 
     # 결과 로그 저장
@@ -694,6 +817,7 @@ def main():
         "repo_name": repo_name,
         "readme_path": str(readme_path),
         "readme_summary": readme_summary,
+        "readme_pages": readme_pages,
         "repo_analysis": repo_analysis,
         "outline": outline
     }
@@ -709,6 +833,7 @@ def main():
     print("분석 JSON :", out_dir / "analysis.json")
     print("자막 파일 :", srt_path)
     print("최종 영상 :", final_mp4)
+    open_file_with_default_app(final_mp4)
 
 
 if __name__ == "__main__":
