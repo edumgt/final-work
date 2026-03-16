@@ -806,6 +806,8 @@ def create_slide_image(title, body, out_path: Path, footer="", tree_text=None, i
 
     # 본문
     draw.rounded_rectangle((40, 118, VIDEO_WIDTH - 40, VIDEO_HEIGHT - 88), radius=24, fill=(14, 20, 32))
+    text_bottom = 592 if tree_text else 606
+
     if image_path:
         image_box = (72, 146, VIDEO_WIDTH - 144, 330)
         draw.rounded_rectangle((68, 142, VIDEO_WIDTH - 68, 510), radius=20, fill=(22, 30, 46))
@@ -839,6 +841,84 @@ def create_slide_image(title, body, out_path: Path, footer="", tree_text=None, i
 
     img.save(out_path)
 
+def create_slide_image_v2(title, body, out_path: Path, footer="", tree_text=None, image_path=None, image_caption=None):
+    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), DEFAULT_BG)
+    draw = ImageDraw.Draw(img)
+    small_font = load_font(20)
+    text_bottom = 592 if tree_text else 606
+
+    draw.rectangle((0, 0, VIDEO_WIDTH, 104), fill=(18, 25, 40))
+    draw.rectangle((0, 100, VIDEO_WIDTH, 106), fill=ACCENT)
+    fit_text_block(
+        draw,
+        title,
+        (56, 16, VIDEO_WIDTH - 112, 74),
+        (38, 24),
+        DEFAULT_FG,
+        bold=True,
+        max_lines=2
+    )
+
+    draw.rounded_rectangle((40, 130, VIDEO_WIDTH - 40, VIDEO_HEIGHT - 82), radius=24, fill=(14, 20, 32))
+
+    if image_path:
+        image_box = (84, 156, VIDEO_WIDTH - 168, 298)
+        draw.rounded_rectangle((76, 148, VIDEO_WIDTH - 76, 468), radius=20, fill=(22, 30, 46))
+        loaded = paste_contained_image(img, Path(image_path), image_box)
+        caption_text = shorten_lines(image_caption or body, max_lines=4, max_chars=220)
+        if loaded and caption_text:
+            fit_text_block(
+                draw,
+                caption_text,
+                (84, 494, VIDEO_WIDTH - 168, 108),
+                (28, 20),
+                DEFAULT_FG,
+                max_lines=4
+            )
+        elif body:
+            fit_text_block(
+                draw,
+                shorten_lines(body, max_lines=8, max_chars=320),
+                (84, 188, VIDEO_WIDTH - 168, 360),
+                (28, 18),
+                DEFAULT_FG,
+                max_lines=8
+            )
+    else:
+        fit_text_block(
+            draw,
+            shorten_lines(body, max_lines=10, max_chars=520),
+            (78, 158, VIDEO_WIDTH - 156, text_bottom - 158),
+            (30, 18),
+            DEFAULT_FG,
+            max_lines=10
+        )
+
+    if tree_text:
+        draw.rounded_rectangle((56, 414, VIDEO_WIDTH - 56, 646), radius=18, fill=(16, 22, 35))
+        fit_text_block(
+            draw,
+            "프로젝트 구조 미리보기",
+            (80, 430, VIDEO_WIDTH - 160, 28),
+            (24, 20),
+            ACCENT,
+            bold=True,
+            max_lines=1
+        )
+        fit_text_block(
+            draw,
+            shorten_lines(tree_text, max_lines=9, max_chars=360),
+            (80, 474, VIDEO_WIDTH - 160, 146),
+            (20, 14),
+            MUTED,
+            max_lines=9
+        )
+
+    if footer:
+        draw.text((60, VIDEO_HEIGHT - 48), footer, font=small_font, fill=MUTED)
+
+    img.save(out_path)
+
 
 # =========================================================
 # 영상 조립
@@ -865,7 +945,7 @@ def create_video_from_sections(sections, work_dir: Path, final_mp4: Path):
         footer_text = sec.get("footer", f"Section {i:02d}")
         duration_override = sec.get("duration")
 
-        create_slide_image(
+        create_slide_image_v2(
             title=sec["title"],
             body=body_text,
             out_path=slide_png,
