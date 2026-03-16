@@ -1,0 +1,706 @@
+import os
+import re
+import sys
+import json
+import math
+import time
+import shutil
+import textwrap
+import argparse
+import subprocess
+from pathlib import Path
+from collections import Counter, defaultdict
+
+import pyttsx3
+from PIL import Image, ImageDraw, ImageFont
+from bs4 import BeautifulSoup
+import markdown as md
+
+
+# =========================================================
+# 설정
+# =========================================================
+
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+FPS = 30
+TARGET_TOTAL_SECONDS = 300  # 5분
+DEFAULT_BG = (10, 14, 24)
+DEFAULT_FG = (240, 244, 255)
+ACCENT = (83, 163, 255)
+MUTED = (170, 180, 200)
+
+SUPPORTED_CODE_EXT = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".go", ".rs", ".cpp", ".c",
+    ".cs", ".php", ".rb", ".swift", ".sql", ".html", ".css", ".scss", ".md", ".yml",
+    ".yaml", ".json", ".xml", ".sh", ".bat", ".ps1", ".vue"
+}
+
+IGNORE_DIRS = {
+    ".git", "node_modules", "dist", "build", "out", ".next", ".nuxt", ".idea",
+    ".vscode", "__pycache__", "coverage", ".venv", "venv", ".mypy_cache", ".pytest_cache"
+}
+
+README_CANDIDATES = ["README.md", "readme.md", "Readme.md"]
+
+# Windows 기본 폰트 후보
+FONT_CANDIDATES = [
+    "C:/Windows/Fonts/malgun.ttf",
+    "C:/Windows/Fonts/malgunbd.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+]
+
+
+# =========================================================
+# 유틸
+# =========================================================
+
+def run_cmd(cmd, check=True):
+    print("[CMD]", " ".join(map(str, cmd)))
+    return subprocess.run(cmd, check=check)
+
+def safe_mkdir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def load_font(size=32, bold=False):
+    for fp in FONT_CANDIDATES:
+        if os.path.exists(fp):
+            try:
+                return ImageFont.truetype(fp, size=size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+def read_text_file(path: Path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            return path.read_text(encoding="cp949")
+        except Exception:
+            try:
+                return path.read_text(encoding="latin-1")
+            except Exception:
+                return ""
+
+def clean_text(text: str):
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def estimate_speech_seconds(text: str, chars_per_sec=10.5):
+    # 한국어/영어 혼합 대략치
+    sec = max(4, int(len(text) / chars_per_sec))
+    return sec
+
+def shorten(text, max_len=240):
+    text = clean_text(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "..."
+
+def format_count(n):
+    return f"{n:,}"
+
+def find_readme(repo_dir: Path):
+    for name in README_CANDIDATES:
+        p = repo_dir / name
+        if p.exists():
+            return p
+    for p in repo_dir.glob("README*"):
+        if p.is_file():
+            return p
+    return None
+
+
+# =========================================================
+# README 분석
+# =========================================================
+
+def markdown_to_plain_text(markdown_text: str) -> str:
+    html = md.markdown(markdown_text)
+    soup = BeautifulSoup(html, "html.parser")
+    return clean_text(soup.get_text("\n"))
+
+def extract_readme_sections(markdown_text: str):
+    lines = markdown_text.splitlines()
+    sections = []
+    current_title = "소개"
+    current_body = []
+
+    for line in lines:
+        m = re.match(r"^(#{1,6})\s+(.*)", line.strip())
+        if m:
+            if current_body:
+                sections.append({
+                    "title": current_title,
+                    "body": clean_text("\n".join(current_body))
+                })
+            current_title = m.group(2).strip()
+            current_body = []
+        else:
+            current_body.append(line)
+
+    if current_body:
+        sections.append({
+            "title": current_title,
+            "body": clean_text("\n".join(current_body))
+        })
+
+    return [s for s in sections if s["body"]]
+
+def summarize_readme(markdown_text: str):
+    plain = markdown_to_plain_text(markdown_text)
+    sections = extract_readme_sections(markdown_text)
+
+    intro = shorten(plain, 500)
+
+    important_sections = []
+    for s in sections[:8]:
+        important_sections.append({
+            "title": s["title"],
+            "summary": shorten(s["body"], 260)
+        })
+
+    badges = re.findall(r"!\[.*?\]\((.*?)\)", markdown_text)
+    links = re.findall(r"\[.*?\]\((.*?)\)", markdown_text)
+
+    return {
+        "intro": intro,
+        "sections": important_sections,
+        "badge_count": len(badges),
+        "link_count": len(links)
+    }
+
+
+# =========================================================
+# 소스코드 분석
+# =========================================================
+
+def should_skip_dir(dir_name: str):
+    return dir_name in IGNORE_DIRS or dir_name.startswith(".")
+
+def analyze_repo(repo_dir: Path):
+    ext_counter = Counter()
+    file_sizes = []
+    dir_counter = Counter()
+    code_files = []
+    total_lines = 0
+    total_files = 0
+    special_files = []
+
+    for root, dirs, files in os.walk(repo_dir):
+        dirs[:] = [d for d in dirs if not should_skip_dir(d)]
+
+        rel_root = Path(root).relative_to(repo_dir)
+        if str(rel_root) != ".":
+            top = str(rel_root.parts[0]) if rel_root.parts else "."
+            dir_counter[top] += len(files)
+
+        for file in files:
+            fp = Path(root) / file
+            rel = fp.relative_to(repo_dir)
+
+            if fp.name.startswith("."):
+                continue
+
+            ext = fp.suffix.lower()
+            total_files += 1
+
+            if ext in SUPPORTED_CODE_EXT:
+                ext_counter[ext] += 1
+                code_files.append(rel)
+
+                text = read_text_file(fp)
+                lines = text.count("\n") + 1 if text else 0
+                total_lines += lines
+                file_sizes.append((rel, lines))
+
+            lower_name = fp.name.lower()
+            if lower_name in {
+                "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                "package.json", "requirements.txt", "pom.xml", "build.gradle",
+                "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+                "server.js", "main.py", "app.py", "manage.py"
+            }:
+                special_files.append(str(rel))
+
+    largest_files = sorted(file_sizes, key=lambda x: x[1], reverse=True)[:10]
+
+    top_dirs = dir_counter.most_common(8)
+    top_exts = ext_counter.most_common(10)
+
+    return {
+        "total_files": total_files,
+        "total_lines": total_lines,
+        "top_extensions": top_exts,
+        "top_dirs": top_dirs,
+        "largest_files": [(str(p), lines) for p, lines in largest_files],
+        "special_files": special_files[:20],
+        "code_file_count": sum(ext_counter.values())
+    }
+
+def detect_project_type(analysis):
+    exts = dict(analysis["top_extensions"])
+    specials = set(map(str.lower, analysis["special_files"]))
+
+    if "package.json" in specials:
+        if ".tsx" in exts or ".jsx" in exts:
+            return "Node.js 기반 프론트엔드 또는 풀스택 프로젝트"
+        return "Node.js 기반 프로젝트"
+
+    if "requirements.txt" in specials or ".py" in exts:
+        return "Python 기반 프로젝트"
+
+    if "pom.xml" in specials or "build.gradle" in specials or ".java" in exts:
+        return "Java 기반 프로젝트"
+
+    if ".go" in exts:
+        return "Go 기반 프로젝트"
+
+    if ".rs" in exts:
+        return "Rust 기반 프로젝트"
+
+    return "복합 기술 스택 프로젝트"
+
+def build_file_tree(repo_dir: Path, max_depth=2, max_items_per_dir=8):
+    result = []
+
+    def walk(path: Path, prefix="", depth=0):
+        if depth > max_depth:
+            return
+        try:
+            items = sorted(
+                [p for p in path.iterdir() if not p.name.startswith(".") and p.name not in IGNORE_DIRS],
+                key=lambda x: (x.is_file(), x.name.lower())
+            )
+        except Exception:
+            return
+
+        for i, item in enumerate(items[:max_items_per_dir]):
+            connector = "└─ " if i == len(items[:max_items_per_dir]) - 1 else "├─ "
+            result.append(prefix + connector + item.name)
+            if item.is_dir():
+                extension = "   " if i == len(items[:max_items_per_dir]) - 1 else "│  "
+                walk(item, prefix + extension, depth + 1)
+
+        if len(items) > max_items_per_dir:
+            result.append(prefix + f"└─ ... ({len(items) - max_items_per_dir} more)")
+
+    walk(repo_dir, "", 0)
+    return "\n".join(result[:120])
+
+
+# =========================================================
+# 내레이션 스크립트 생성
+# =========================================================
+
+def create_video_outline(repo_name, readme_summary, repo_analysis, tree_text):
+    project_type = detect_project_type(repo_analysis)
+
+    top_ext_text = ", ".join(
+        [f"{ext} {cnt}개" for ext, cnt in repo_analysis["top_extensions"][:5]]
+    ) or "분석 가능한 코드 파일 정보가 많지 않습니다"
+
+    top_dir_text = ", ".join(
+        [f"{name}({cnt})" for name, cnt in repo_analysis["top_dirs"][:5]]
+    ) or "주요 디렉터리 정보가 제한적입니다"
+
+    big_files_text = ", ".join(
+        [f"{name}({lines} lines)" for name, lines in repo_analysis["largest_files"][:5]]
+    ) or "대형 파일 정보 없음"
+
+    special_text = ", ".join(repo_analysis["special_files"][:8]) or "특별히 눈에 띄는 설정 파일은 많지 않습니다"
+
+    sections = []
+
+    sections.append({
+        "title": f"{repo_name} 프로젝트 개요",
+        "narration": (
+            f"안녕하세요. 이번 영상에서는 GitHub 저장소 {repo_name} 를 분석합니다. "
+            f"이 프로젝트는 전체적으로 {project_type} 성격을 가지고 있습니다. "
+            f"먼저 README 문서를 기준으로 프로젝트 목적과 기능을 살펴보고, "
+            f"그 다음 실제 소스 구조와 기술 스택, 그리고 확장 포인트를 순서대로 정리하겠습니다."
+        )
+    })
+
+    sections.append({
+        "title": "README 핵심 요약",
+        "narration": (
+            f"README를 보면 프로젝트의 핵심 설명은 다음과 같습니다. "
+            f"{shorten(readme_summary['intro'], 420)} "
+            f"문서 안에는 배지 {readme_summary['badge_count']}개, 링크 {readme_summary['link_count']}개가 포함되어 있어 "
+            f"프로젝트 소개와 외부 연계 정보가 비교적 잘 정리된 편입니다."
+        )
+    })
+
+    for sec in readme_summary["sections"][:4]:
+        sections.append({
+            "title": f"README 섹션: {sec['title']}",
+            "narration": (
+                f"다음은 README의 {sec['title']} 섹션입니다. "
+                f"{shorten(sec['summary'], 380)}"
+            )
+        })
+
+    sections.append({
+        "title": "저장소 구조 분석",
+        "narration": (
+            f"이 저장소에는 총 {format_count(repo_analysis['total_files'])}개의 파일이 있으며, "
+            f"분석 가능한 코드 파일은 {format_count(repo_analysis['code_file_count'])}개입니다. "
+            f"전체 코드 라인 수는 대략 {format_count(repo_analysis['total_lines'])}줄 수준입니다. "
+            f"주요 확장자는 {top_ext_text} 순으로 나타납니다."
+        )
+    })
+
+    sections.append({
+        "title": "주요 디렉터리와 파일",
+        "narration": (
+            f"디렉터리 분포를 보면 {top_dir_text} 중심으로 구성되어 있습니다. "
+            f"특히 눈에 띄는 파일은 {special_text} 입니다. "
+            f"이 파일들을 보면 프로젝트의 실행 방식, 배포 방식, 의존성 관리 방식을 대략 짐작할 수 있습니다."
+        )
+    })
+
+    sections.append({
+        "title": "복잡도가 큰 파일",
+        "narration": (
+            f"라인 수 기준으로 상대적으로 큰 파일은 {big_files_text} 입니다. "
+            f"대형 파일은 보통 핵심 비즈니스 로직, UI 엔트리 포인트, 혹은 설정 집약 파일일 가능성이 높습니다. "
+            f"리팩토링이나 기능 확장 시 이 파일들을 우선 검토하는 것이 효율적입니다."
+        )
+    })
+
+    sections.append({
+        "title": "폴더 트리 개요",
+        "narration": (
+            "프로젝트의 폴더 구조를 간단히 보면 기능별 분리 수준과 유지보수성을 가늠할 수 있습니다. "
+            "일반적으로 루트에 설정 파일, 그 아래에 애플리케이션 소스, 그리고 필요시 자산이나 문서 폴더가 배치됩니다. "
+            "구조가 명확할수록 협업과 배포 자동화가 수월해집니다."
+        ),
+        "extra_tree": tree_text
+    })
+
+    sections.append({
+        "title": "기술적 해석",
+        "narration": (
+            f"이 저장소를 기술적으로 보면, README와 실제 코드 구성을 통해 "
+            f"{project_type}의 전형적인 패턴이 어느 정도 드러납니다. "
+            f"문서화 수준, 설정 파일 존재 여부, 소스 분리 정도를 기준으로 볼 때 "
+            f"학습용, 포트폴리오용, 혹은 실서비스 확장용 기반으로 활용할 수 있습니다."
+        )
+    })
+
+    sections.append({
+        "title": "개선 포인트",
+        "narration": (
+            "개선 관점에서는 첫째, README에 실행 방법과 아키텍처 설명을 더 구조화하면 좋습니다. "
+            "둘째, 대형 파일이 있다면 모듈 단위 분리를 고려할 수 있습니다. "
+            "셋째, 테스트 코드와 배포 파이프라인 문서가 있다면 신뢰성이 높아집니다. "
+            "넷째, 주요 기능 흐름을 다이어그램으로 추가하면 신규 참여자의 이해 속도가 빨라집니다."
+        )
+    })
+
+    sections.append({
+        "title": "마무리",
+        "narration": (
+            f"정리하면 {repo_name} 저장소는 README 기준 목적이 비교적 분명하고, "
+            f"소스 구조상으로도 확장 가능성이 확인되는 프로젝트입니다. "
+            f"앞으로는 실행 방법, 핵심 아키텍처, 주요 시나리오를 더 명확히 정리하면 "
+            f"학습 자료이면서 동시에 포트폴리오 자료로도 더욱 강해질 수 있습니다. "
+            f"이상으로 저장소 분석을 마치겠습니다."
+        )
+    })
+
+    return sections
+
+
+def rebalance_to_target(sections, target_seconds=300):
+    # 내레이션 길이가 너무 짧으면 일부 문장을 확장
+    total = sum(estimate_speech_seconds(s["narration"]) for s in sections)
+    if total >= int(target_seconds * 0.85):
+        return sections
+
+    pad_sentence = (
+        " 이 부분은 실제 구현 세부 사항과 운영 방식까지 함께 보면 더 정확하게 해석할 수 있습니다."
+    )
+
+    i = 0
+    while total < target_seconds and i < 200:
+        idx = i % len(sections)
+        sections[idx]["narration"] += pad_sentence
+        total = sum(estimate_speech_seconds(s["narration"]) for s in sections)
+        i += 1
+
+    return sections
+
+
+# =========================================================
+# TTS / 자막
+# =========================================================
+
+def tts_to_file(text, out_wav: Path, rate=165, voice_keyword=None):
+    engine = pyttsx3.init()
+    engine.setProperty("rate", rate)
+
+    if voice_keyword:
+        voices = engine.getProperty("voices")
+        for v in voices:
+            name = (getattr(v, "name", "") or "").lower()
+            vid = (getattr(v, "id", "") or "").lower()
+            if voice_keyword.lower() in name or voice_keyword.lower() in vid:
+                engine.setProperty("voice", v.id)
+                break
+
+    engine.save_to_file(text, str(out_wav))
+    engine.runAndWait()
+
+def ffprobe_duration(file_path: Path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path)
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return 0.0
+    try:
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+def write_srt(srt_path: Path, segments):
+    with srt_path.open("w", encoding="utf-8") as f:
+        for idx, seg in enumerate(segments, start=1):
+            start = seg["start"]
+            end = seg["end"]
+            text = seg["text"]
+
+            def fmt(t):
+                h = int(t // 3600)
+                m = int((t % 3600) // 60)
+                s = int(t % 60)
+                ms = int((t - int(t)) * 1000)
+                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+            f.write(f"{idx}\n")
+            f.write(f"{fmt(start)} --> {fmt(end)}\n")
+            f.write(text.strip() + "\n\n")
+
+
+# =========================================================
+# 슬라이드 생성
+# =========================================================
+
+def draw_multiline(draw, text, box, font, fill, line_spacing=8):
+    x, y, w, h = box
+    words = text.split()
+    lines = []
+    cur = ""
+
+    for word in words:
+        test = cur + (" " if cur else "") + word
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= w:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+
+    cur_y = y
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_h = bbox[3] - bbox[1]
+        if cur_y + line_h > y + h:
+            break
+        draw.text((x, cur_y), line, font=font, fill=fill)
+        cur_y += line_h + line_spacing
+
+def create_slide_image(title, body, out_path: Path, footer="", tree_text=None):
+    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), DEFAULT_BG)
+    draw = ImageDraw.Draw(img)
+
+    title_font = load_font(42, bold=True)
+    body_font = load_font(28)
+    small_font = load_font(20)
+
+    # 상단 라인
+    draw.rectangle((0, 0, VIDEO_WIDTH, 90), fill=(18, 25, 40))
+    draw.rectangle((0, 88, VIDEO_WIDTH, 94), fill=ACCENT)
+
+    draw.text((60, 28), title, font=title_font, fill=DEFAULT_FG)
+
+    # 본문
+    body_box = (60, 130, VIDEO_WIDTH - 120, 360)
+    draw_multiline(draw, body, body_box, body_font, DEFAULT_FG, line_spacing=10)
+
+    # 트리 또는 추가 정보
+    if tree_text:
+        tree_font = load_font(20)
+        draw.rounded_rectangle((60, 420, VIDEO_WIDTH - 60, 650), radius=18, fill=(16, 22, 35))
+        draw.text((80, 440), "폴더 구조 미리보기", font=load_font(24, bold=True), fill=ACCENT)
+        draw_multiline(
+            draw,
+            tree_text,
+            (80, 485, VIDEO_WIDTH - 160, 140),
+            tree_font,
+            MUTED,
+            line_spacing=5
+        )
+
+    # 하단 푸터
+    if footer:
+        draw.text((60, VIDEO_HEIGHT - 48), footer, font=small_font, fill=MUTED)
+
+    img.save(out_path)
+
+
+# =========================================================
+# 영상 조립
+# =========================================================
+
+def create_video_from_sections(sections, work_dir: Path, final_mp4: Path):
+    slides_dir = work_dir / "slides"
+    audio_dir = work_dir / "audio"
+    clips_dir = work_dir / "clips"
+    safe_mkdir(slides_dir)
+    safe_mkdir(audio_dir)
+    safe_mkdir(clips_dir)
+
+    srt_segments = []
+    concat_list_path = work_dir / "concat.txt"
+    concat_lines = []
+    elapsed = 0.0
+
+    for i, sec in enumerate(sections, start=1):
+        slide_png = slides_dir / f"slide_{i:02d}.png"
+        audio_wav = audio_dir / f"audio_{i:02d}.wav"
+        clip_mp4 = clips_dir / f"clip_{i:02d}.mp4"
+
+        create_slide_image(
+            title=sec["title"],
+            body=sec["narration"],
+            out_path=slide_png,
+            footer=f"Section {i:02d}",
+            tree_text=sec.get("extra_tree")
+        )
+
+        tts_to_file(sec["narration"], audio_wav, rate=165, voice_keyword=None)
+        duration = ffprobe_duration(audio_wav)
+        if duration <= 0:
+            duration = estimate_speech_seconds(sec["narration"])
+
+        srt_segments.append({
+            "start": elapsed,
+            "end": elapsed + duration,
+            "text": sec["narration"]
+        })
+        elapsed += duration
+
+        # 슬라이드 1장 + 오디오로 클립 생성
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(slide_png),
+            "-i", str(audio_wav),
+            "-c:v", "libx264",
+            "-t", f"{duration:.3f}",
+            "-pix_fmt", "yuv420p",
+            "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT},fps={FPS}",
+            "-c:a", "aac",
+            "-shortest",
+            str(clip_mp4)
+        ]
+        run_cmd(cmd)
+
+        concat_lines.append(f"file '{clip_mp4.as_posix()}'")
+
+    concat_list_path.write_text("\n".join(concat_lines), encoding="utf-8")
+
+    temp_video = work_dir / "joined.mp4"
+    run_cmd([
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_list_path),
+        "-c", "copy",
+        str(temp_video)
+    ])
+
+    srt_path = work_dir / "subtitles.srt"
+    write_srt(srt_path, srt_segments)
+
+    # 자막 입히기
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", str(temp_video),
+        "-vf", f"subtitles={srt_path.as_posix()}",
+        "-c:a", "copy",
+        str(final_mp4)
+    ])
+
+    return srt_path
+
+
+# =========================================================
+# 메인
+# =========================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", required=True, help="분석할 로컬 GitHub repo 경로")
+    parser.add_argument("--out", default="./repo_video_output", help="출력 폴더")
+    args = parser.parse_args()
+
+    repo_dir = Path(args.repo).resolve()
+    out_dir = Path(args.out).resolve()
+    safe_mkdir(out_dir)
+
+    if not repo_dir.exists():
+        print(f"[ERROR] repo 경로가 없습니다: {repo_dir}")
+        sys.exit(1)
+
+    readme_path = find_readme(repo_dir)
+    if not readme_path:
+        print("[ERROR] README 파일을 찾지 못했습니다.")
+        sys.exit(1)
+
+    repo_name = repo_dir.name
+    readme_text = read_text_file(readme_path)
+    readme_summary = summarize_readme(readme_text)
+    repo_analysis = analyze_repo(repo_dir)
+    tree_text = build_file_tree(repo_dir, max_depth=2, max_items_per_dir=8)
+
+    outline = create_video_outline(repo_name, readme_summary, repo_analysis, tree_text)
+    outline = rebalance_to_target(outline, target_seconds=TARGET_TOTAL_SECONDS)
+
+    # 결과 로그 저장
+    analysis_json = {
+        "repo_name": repo_name,
+        "readme_path": str(readme_path),
+        "readme_summary": readme_summary,
+        "repo_analysis": repo_analysis,
+        "outline": outline
+    }
+    (out_dir / "analysis.json").write_text(
+        json.dumps(analysis_json, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    final_mp4 = out_dir / f"{repo_name}_analysis_video.mp4"
+    srt_path = create_video_from_sections(outline, out_dir, final_mp4)
+
+    print("\n=== 완료 ===")
+    print("분석 JSON :", out_dir / "analysis.json")
+    print("자막 파일 :", srt_path)
+    print("최종 영상 :", final_mp4)
+
+
+if __name__ == "__main__":
+    main()
