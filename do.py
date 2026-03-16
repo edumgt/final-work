@@ -121,6 +121,29 @@ def shorten(text, max_len=240):
         return text
     return text[:max_len - 3] + "..."
 
+def shorten_lines(text, max_lines=8, max_chars=420):
+    text = clean_text(text)
+    if len(text) > max_chars:
+        text = shorten(text, max_chars)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    kept = lines[:max_lines]
+    kept[-1] = shorten(kept[-1], max(24, len(kept[-1]) - 3))
+    if not kept[-1].endswith("..."):
+        kept[-1] += " ..."
+    return "\n".join(kept)
+
+def normalize_display_text(text: str) -> str:
+    text = text.replace("\\", "/")
+    text = re.sub(r"\s*\|\s*", " | ", text)
+    text = re.sub(r"\s*-\s*", " - ", text)
+    text = re.sub(r",\s*", ", ", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"([/|])", r" \1 ", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
 def format_count(n):
     return f"{n:,}"
 
@@ -194,6 +217,56 @@ def summarize_readme(markdown_text: str):
         "link_count": len(links)
     }
 
+def resolve_readme_asset_path(readme_path: Path, raw_path: str):
+    asset = (raw_path or "").strip().strip("'\"")
+    if not asset or re.match(r"^[a-z]+://", asset, re.IGNORECASE):
+        return None
+    asset = asset.split("?", 1)[0].split("#", 1)[0]
+    candidate = (readme_path.parent / asset).resolve()
+    if candidate.exists() and candidate.is_file():
+        return candidate
+    return None
+
+def extract_readme_images(markdown_text: str, readme_path: Path):
+    images = []
+
+    for alt, src in re.findall(r"!\[([^\]]*)\]\(([^)]+)\)", markdown_text):
+        resolved = resolve_readme_asset_path(readme_path, src)
+        if resolved:
+            images.append({
+                "alt": clean_text(alt) or resolved.stem,
+                "src": src,
+                "path": resolved
+            })
+
+    for src, alt in re.findall(r"<img[^>]*src=[\"']([^\"']+)[\"'][^>]*alt=[\"']([^\"']*)[\"'][^>]*>", markdown_text, re.IGNORECASE):
+        resolved = resolve_readme_asset_path(readme_path, src)
+        if resolved:
+            images.append({
+                "alt": clean_text(alt) or resolved.stem,
+                "src": src,
+                "path": resolved
+            })
+
+    for alt, src in re.findall(r"<img[^>]*alt=[\"']([^\"']*)[\"'][^>]*src=[\"']([^\"']+)[\"'][^>]*>", markdown_text, re.IGNORECASE):
+        resolved = resolve_readme_asset_path(readme_path, src)
+        if resolved:
+            images.append({
+                "alt": clean_text(alt) or resolved.stem,
+                "src": src,
+                "path": resolved
+            })
+
+    unique = []
+    seen = set()
+    for image in images:
+        key = str(image["path"]).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(image)
+    return unique
+
 def normalize_markdown_line(line: str) -> str:
     line = line.rstrip()
     if not line:
@@ -213,14 +286,16 @@ def normalize_markdown_line(line: str) -> str:
         return title
     return clean_text(line)
 
-def paginate_readme_for_slides(markdown_text: str, page_chars=380, max_pages=12):
+def paginate_readme_for_slides(markdown_text: str, readme_path: Path, page_chars=380, max_pages=12):
     sections = extract_readme_sections(markdown_text)
     pages = []
+    all_images = extract_readme_images(markdown_text, readme_path)
+    image_cursor = 0
 
     for sec in sections:
         raw_lines = [normalize_markdown_line(line) for line in sec["body"].splitlines()]
         lines = [line for line in raw_lines if line]
-        if not lines:
+        if not lines and image_cursor >= len(all_images):
             continue
 
         current = []
@@ -249,6 +324,17 @@ def paginate_readme_for_slides(markdown_text: str, page_chars=380, max_pages=12)
                 "body": "\n".join(current),
                 "page_no": page_no
             })
+
+        if image_cursor < len(all_images):
+            image = all_images[image_cursor]
+            pages.append({
+                "title": sec["title"],
+                "body": image["alt"],
+                "page_no": page_no + (1 if current else 0),
+                "image_path": str(image["path"]),
+                "image_caption": image["alt"]
+            })
+            image_cursor += 1
 
         if len(pages) >= max_pages:
             break
@@ -430,7 +516,9 @@ def create_video_outline(repo_name, readme_summary, repo_analysis, tree_text, re
             ),
             "display_body": page["body"],
             "duration": 10.0,
-            "footer": f"README {page_label}"
+            "footer": f"README {page_label}",
+            "image_path": page.get("image_path"),
+            "image_caption": page.get("image_caption")
         })
 
     for sec in readme_summary["sections"][:4]:
@@ -592,9 +680,7 @@ def write_srt(srt_path: Path, segments):
 # 슬라이드 생성
 # =========================================================
 
-def draw_multiline(draw, text, box, font, fill, line_spacing=8):
-    x, y, w, h = box
-
+def wrap_text_lines(draw, text, font, width):
     def text_width(value: str) -> int:
         if not value:
             return 0
@@ -613,12 +699,12 @@ def draw_multiline(draw, text, box, font, fill, line_spacing=8):
         current = ""
         for token in tokens:
             candidate = current + token
-            if current and text_width(candidate.rstrip()) > w:
+            if current and text_width(candidate.rstrip()) > width:
                 stripped = token.strip()
-                if text_width(token.rstrip()) > w and stripped:
+                if text_width(token.rstrip()) > width and stripped:
                     for ch in stripped:
                         char_candidate = current + ch
-                        if current and text_width(char_candidate) > w:
+                        if current and text_width(char_candidate) > width:
                             lines.append(current.rstrip())
                             current = ch
                         else:
@@ -636,20 +722,75 @@ def draw_multiline(draw, text, box, font, fill, line_spacing=8):
         return lines
 
     lines = []
-    for paragraph in text.splitlines():
-        wrapped = wrap_paragraph(paragraph)
-        lines.extend(wrapped)
+    for paragraph in text.splitlines() or [""]:
+        lines.extend(wrap_paragraph(paragraph))
+    return lines
 
+def fit_text_block(draw, text, box, size_range, fill, bold=False, align="left", max_lines=None, min_line_spacing=6, max_line_spacing=14):
+    x, y, w, h = box
+    text = normalize_display_text(text)
+
+    for size in range(size_range[0], size_range[1] - 1, -1):
+        font = load_font(size, bold=bold)
+        line_spacing = max(min_line_spacing, min(max_line_spacing, int(size * 0.35)))
+        lines = wrap_text_lines(draw, text, font, w)
+        if max_lines and len(lines) > max_lines:
+            continue
+
+        line_heights = []
+        total_height = 0
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line or "Ag", font=font)
+            line_h = bbox[3] - bbox[1]
+            line_heights.append(line_h)
+            total_height += line_h
+        if lines:
+            total_height += line_spacing * (len(lines) - 1)
+
+        if total_height <= h:
+            cur_y = y + max(0, (h - total_height) // 2)
+            for idx, line in enumerate(lines):
+                bbox = draw.textbbox((0, 0), line or "Ag", font=font)
+                line_w = bbox[2] - bbox[0]
+                if align == "center":
+                    draw_x = x + max(0, (w - line_w) // 2)
+                else:
+                    draw_x = x
+                draw.text((draw_x, cur_y), line, font=font, fill=fill)
+                cur_y += line_heights[idx] + line_spacing
+            return size, len(lines)
+
+    fallback_font = load_font(size_range[1], bold=bold)
+    fallback_lines = wrap_text_lines(draw, text, fallback_font, w)
+    if max_lines:
+        fallback_lines = fallback_lines[:max_lines]
+        if fallback_lines:
+            fallback_lines[-1] = shorten(fallback_lines[-1], max(16, len(fallback_lines[-1]) - 3))
+    line_spacing = min_line_spacing
     cur_y = y
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line or "Ag", font=font)
+    for line in fallback_lines:
+        bbox = draw.textbbox((0, 0), line or "Ag", font=fallback_font)
         line_h = bbox[3] - bbox[1]
         if cur_y + line_h > y + h:
             break
-        draw.text((x, cur_y), line, font=font, fill=fill)
+        draw.text((x, cur_y), line, font=fallback_font, fill=fill)
         cur_y += line_h + line_spacing
+    return size_range[1], len(fallback_lines)
 
-def create_slide_image(title, body, out_path: Path, footer="", tree_text=None):
+def paste_contained_image(base_image, image_path: Path, box):
+    x, y, w, h = box
+    try:
+        with Image.open(image_path) as src:
+            rendered = src.convert("RGB")
+            rendered.thumbnail((w, h))
+            offset_x = x + max(0, (w - rendered.width) // 2)
+            offset_y = y + max(0, (h - rendered.height) // 2)
+            base_image.paste(rendered, (offset_x, offset_y))
+            return True
+    except Exception:
+        return False
+
+def create_slide_image(title, body, out_path: Path, footer="", tree_text=None, image_path=None, image_caption=None):
     img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), DEFAULT_BG)
     draw = ImageDraw.Draw(img)
 
@@ -665,8 +806,18 @@ def create_slide_image(title, body, out_path: Path, footer="", tree_text=None):
 
     # 본문
     draw.rounded_rectangle((40, 118, VIDEO_WIDTH - 40, VIDEO_HEIGHT - 88), radius=24, fill=(14, 20, 32))
-    body_box = (72, 150, VIDEO_WIDTH - 144, 470)
-    draw_multiline(draw, body, body_box, body_font, DEFAULT_FG, line_spacing=12)
+    if image_path:
+        image_box = (72, 146, VIDEO_WIDTH - 144, 330)
+        draw.rounded_rectangle((68, 142, VIDEO_WIDTH - 68, 510), radius=20, fill=(22, 30, 46))
+        loaded = paste_contained_image(img, Path(image_path), image_box)
+        caption_text = image_caption or body
+        if loaded and caption_text:
+            draw_multiline(draw, caption_text, (72, 538, VIDEO_WIDTH - 144, 96), body_font, DEFAULT_FG, line_spacing=10)
+        elif body:
+            draw_multiline(draw, body, (72, 180, VIDEO_WIDTH - 144, 430), body_font, DEFAULT_FG, line_spacing=12)
+    else:
+        body_box = (72, 150, VIDEO_WIDTH - 144, 470)
+        draw_multiline(draw, body, body_box, body_font, DEFAULT_FG, line_spacing=12)
 
     # 트리 또는 추가 정보
     if tree_text:
@@ -719,7 +870,9 @@ def create_video_from_sections(sections, work_dir: Path, final_mp4: Path):
             body=body_text,
             out_path=slide_png,
             footer=footer_text,
-            tree_text=sec.get("extra_tree")
+            tree_text=sec.get("extra_tree"),
+            image_path=sec.get("image_path"),
+            image_caption=sec.get("image_caption")
         )
 
         tts_to_file(sec["narration"], audio_wav, rate=165, voice_keyword=None)
@@ -805,7 +958,7 @@ def main():
     repo_name = repo_dir.name
     readme_text = read_text_file(readme_path)
     readme_summary = summarize_readme(readme_text)
-    readme_pages = paginate_readme_for_slides(readme_text, page_chars=380, max_pages=10)
+    readme_pages = paginate_readme_for_slides(readme_text, readme_path, page_chars=380, max_pages=12)
     repo_analysis = analyze_repo(repo_dir)
     tree_text = build_file_tree(repo_dir, max_depth=2, max_items_per_dir=8)
 
