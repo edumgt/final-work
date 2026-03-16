@@ -60,6 +60,15 @@ def run_cmd(cmd, check=True):
     print("[CMD]", " ".join(map(str, cmd)))
     return subprocess.run(cmd, check=check)
 
+def ffmpeg_filter_path(path: Path) -> str:
+    # FFmpeg filter args treat ":" as an option separator, so Windows drive letters
+    # and a few special characters need escaping inside filter values.
+    escaped = path.resolve().as_posix()
+    escaped = escaped.replace("\\", r"\\")
+    escaped = escaped.replace(":", r"\:")
+    escaped = escaped.replace("'", r"\'")
+    return escaped
+
 def safe_mkdir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
@@ -640,7 +649,7 @@ def create_video_from_sections(sections, work_dir: Path, final_mp4: Path):
     run_cmd([
         "ffmpeg", "-y",
         "-i", str(temp_video),
-        "-vf", f"subtitles={srt_path.as_posix()}",
+        "-vf", f"subtitles='{ffmpeg_filter_path(srt_path)}'",
         "-c:a", "copy",
         str(final_mp4)
     ])
